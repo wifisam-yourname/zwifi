@@ -4,6 +4,7 @@
 # التشغيل:  python zwifi.py   ثم افتح  http://127.0.0.1:8041
 # لا يحتاج أي مكتبات إضافية. لا يحفظ كلمة السر ولا يغيّر أي إعداد.
 import os, time, base64, json, re, ssl, uuid, ipaddress, shutil, subprocess, http.cookiejar, urllib.request, urllib.parse, urllib.error
+import hmac, hashlib, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = 8041
@@ -416,12 +417,218 @@ def devs_op(q):
         try: ipaddress.IPv4Address(ip)
         except ValueError: return l
         old = next((d for d in l if d['ip'] == ip), {})
-        l = [{'ip': ip, 'user': str(q.get('user', ''))[:32], 'name': str(q.get('name') or old.get('name', ''))[:40]}] + [d for d in l if d['ip'] != ip]
+        loc = str(q['loc'] if 'loc' in q else old.get('loc', '')).strip()[:60]
+        l = [{'ip': ip, 'user': str(q.get('user', ''))[:32], 'name': str(q.get('name') or old.get('name', ''))[:40], 'loc': loc}] + [d for d in l if d['ip'] != ip]
     try:
         with open(DEVF, 'w', encoding='utf-8') as f: json.dump(l[:50], f, ensure_ascii=False)
     except OSError:
         pass
     return l[:50]
+
+
+# ───────────────────────── الترخيص ─────────────────────────
+# 20 عملية ناجحة (فحص أو تغيير قناة) ثم يلزم كود تفعيل من 6 أرقام مرتبط بمعرّف الجهاز.
+# المالك يولّد الكود بالسكربت gen_code.py (نفس LIC_SECRET). لا تنشر ذلك السكربت.
+TRIAL_LIMIT = 20
+LIC_SECRET = b'__LIC_SECRET__'
+_ALPHA = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+_LICLOCK = threading.Lock()
+_bad = [0, 0.0]
+
+
+class LicFail(Fail):
+    pass
+
+
+def _licf():
+    return os.path.join(os.path.dirname(DEVF), 'license.json' if os.environ.get('ZWIFI_DATA') else '.zwifi_license.json')
+
+
+def _lic_read():
+    try:
+        with open(_licf(), encoding='utf-8') as f: j = json.load(f)
+        return j if isinstance(j, dict) else {}
+    except Exception:
+        return {}
+
+
+def _lic_write(j):
+    try:
+        with open(_licf(), 'w', encoding='utf-8') as f: json.dump(j, f)
+    except OSError:
+        pass
+
+
+def _app_ctx():
+    from java import jclass
+    return jclass('com.chaquo.python.Python').getPlatform().getApplication()
+
+
+def _android_id():
+    try:
+        from java import jclass
+        S = jclass('android.provider.Settings$Secure')
+        c = _app_ctx()
+        return str(S.getString(c.getContentResolver(), 'android_id') or '')
+    except Exception:
+        return ''
+
+
+def code_for(did):
+    m = hmac.new(LIC_SECRET, ('ZW1|' + did).encode(), hashlib.sha256).digest()
+    return '%06d' % (int.from_bytes(m[:8], 'big') % 1000000)
+
+
+def lic_state():
+    with _LICLOCK:
+        j = _lic_read()
+        if not re.fullmatch(r'[A-Z2-9]{6}', str(j.get('id', ''))):
+            h = hashlib.sha256(('zw|' + (_android_id() or uuid.uuid4().hex)).encode()).digest()
+            j['id'] = ''.join(_ALPHA[b % 32] for b in h[:6])
+            _lic_write(j)
+        try: n = max(0, int(j.get('n', 0)))
+        except Exception: n = 0
+        ok = hmac.compare_digest(str(j.get('act', '')).encode(), code_for(j['id']).encode())
+        return {'id': j['id'], 'used': n, 'limit': TRIAL_LIMIT, 'left': max(0, TRIAL_LIMIT - n), 'licensed': ok}
+
+
+def lic_gate():
+    st = lic_state()
+    if not st['licensed'] and st['left'] <= 0:
+        raise LicFail(f'انتهت التجربة المجانية ({TRIAL_LIMIT} عملية). التطبيق يحتاج ترخيصاً')
+
+
+def lic_count():
+    with _LICLOCK:
+        j = _lic_read()
+        try: j['n'] = max(0, int(j.get('n', 0))) + 1
+        except Exception: j['n'] = 1
+        _lic_write(j)
+
+
+def lic_activate(q):
+    now = time.time()
+    if now < _bad[1]: raise Fail('محاولات خاطئة كثيرة، انتظر %d ثانية' % (_bad[1] - now + 1))
+    code, st = re.sub(r'\D', '', str(q.get('code', ''))), lic_state()
+    if len(code) != 6 or not hmac.compare_digest(code.encode(), code_for(st['id']).encode()):
+        _bad[0] += 1
+        if _bad[0] >= 5: _bad[0], _bad[1] = 0, now + 60
+        raise Fail('كود التفعيل غير صحيح')
+    with _LICLOCK:
+        j = _lic_read()
+        j['act'] = code
+        _lic_write(j)
+    _bad[0] = 0
+    return lic_state()
+
+
+# ───────────────────────── التحديث من داخل التطبيق ─────────────────────────
+# UPDATE_URL: رابط https لملف JSON يحدد آخر إصدار (انظر update.json). فارغ = التحديث معطّل.
+UPDATE_URL = 'https://raw.githubusercontent.com/wifisam-yourname/zwifi/main/update.json'
+_upd = {'state': 'idle', 'pct': 0, 'msg': ''}
+_upd_info = {}
+_UPDLOCK = threading.Lock()
+
+
+def app_version():
+    try:
+        c = _app_ctx()
+        pi = c.getPackageManager().getPackageInfo(c.getPackageName(), 0)
+        try: vc = pi.getLongVersionCode()
+        except Exception: vc = pi.versionCode
+        return int(vc), str(pi.versionName or '')
+    except Exception:
+        return 0, ''
+
+
+def update_check(q=None):
+    if not UPDATE_URL: raise Fail('لم يُضبط رابط التحديث بعد')
+    if not UPDATE_URL.startswith('https://'): raise Fail('رابط التحديث يجب أن يبدأ بـ https')
+    cur, curn = app_version()
+    if not cur: raise Fail('التحديث متاح داخل تطبيق الأندرويد فقط')
+    try:
+        r = urllib.request.Request(UPDATE_URL, headers={'Cache-Control': 'no-cache'})
+        with urllib.request.urlopen(r, timeout=15, context=ssl.create_default_context()) as f: j = json.loads(f.read(65536))
+        new, apk = int(j['versionCode']), str(j['apk'])
+    except Exception as e:
+        raise Fail('تعذر جلب معلومات التحديث: ' + str(e)[:80])
+    if not apk.startswith('https://'): raise Fail('رابط ملف التحديث يجب أن يبدأ بـ https')
+    _upd_info.clear()
+    _upd_info.update(apk=apk, code=new)
+    return {'current': curn or str(cur), 'latest': str(j.get('versionName') or new), 'newer': new > cur, 'notes': str(j.get('notes', ''))[:300]}
+
+
+def _upd_set(**k):
+    with _UPDLOCK: _upd.update(k)
+
+
+def _upd_worker(apk):
+    try:
+        from java import jclass
+        c = _app_ctx()
+        DM, Q, Uri = jclass('android.app.DownloadManager'), jclass('android.app.DownloadManager$Query'), jclass('android.net.Uri')
+        dirt = jclass('android.os.Environment').DIRECTORY_DOWNLOADS
+        name = 'Z-Wifi-update.apk'
+        try: os.remove(os.path.join(str(c.getExternalFilesDir(dirt).getAbsolutePath()), name))
+        except Exception: pass
+        rq = jclass('android.app.DownloadManager$Request')(Uri.parse(apk))
+        rq.setTitle('Z-Wifi')
+        rq.setMimeType('application/vnd.android.package-archive')
+        rq.setDestinationInExternalFilesDir(c, dirt, name)
+        dm = c.getSystemService('download')
+        did = dm.enqueue(rq)
+        t0 = last = time.time()
+        prev = -1
+        while True:
+            cu = dm.query(Q().setFilterById(did))
+            if not cu.moveToFirst():
+                cu.close(); raise Exception('أُلغي التنزيل')
+            st = cu.getInt(cu.getColumnIndex('status'))
+            got, tot = cu.getLong(cu.getColumnIndex('bytes_so_far')), cu.getLong(cu.getColumnIndex('total_size'))
+            why = cu.getInt(cu.getColumnIndex('reason'))
+            cu.close()
+            if st == 8: break
+            if st == 16: raise Exception('فشل التنزيل (رمز %d)' % why)
+            if got != prev: prev, last = got, time.time()
+            if time.time() - last > 90 or time.time() - t0 > 1200: raise Exception('توقف التنزيل، تحقق من الإنترنت')
+            _upd_set(pct=max(1, min(99, int(got * 100 / tot))) if tot > 0 else 1)
+            time.sleep(0.4)
+        uri = dm.getUriForDownloadedFile(did)
+        if uri is None: raise Exception('تعذر الوصول لملف التحديث')
+        I = jclass('android.content.Intent')
+        it = I(I.ACTION_VIEW)
+        it.setDataAndType(uri, 'application/vnd.android.package-archive')
+        it.addFlags(I.FLAG_GRANT_READ_URI_PERMISSION | I.FLAG_ACTIVITY_NEW_TASK)
+        c.startActivity(it)
+        _upd_set(state='installing', pct=100, msg='اضغط «تثبيت» في النافذة التي ظهرت')
+    except Exception as e:
+        _upd_set(state='error', msg=str(e)[:120])
+
+
+def update_start(q=None):
+    with _UPDLOCK:
+        if _upd['state'] in ('downloading', 'installing'): return dict(_upd)
+    apk = _upd_info.get('apk')
+    if not apk: raise Fail('افحص التحديث أولاً')
+    try:
+        from java import jclass
+        c = _app_ctx()
+        if jclass('android.os.Build$VERSION').SDK_INT >= 26 and not c.getPackageManager().canRequestPackageInstalls():
+            I = jclass('android.content.Intent')
+            it = I('android.settings.MANAGE_UNKNOWN_APP_SOURCES', jclass('android.net.Uri').parse('package:' + str(c.getPackageName())))
+            it.addFlags(I.FLAG_ACTIVITY_NEW_TASK)
+            c.startActivity(it)
+            _upd_set(state='needperm', pct=0, msg='فعّل «السماح من هذا المصدر» ثم ارجع واضغط تحديث مرة أخرى')
+            return dict(_upd)
+    except Exception as e:
+        raise Fail('التحديث متاح داخل تطبيق الأندرويد فقط: ' + str(e)[:60])
+    _upd_set(state='downloading', pct=1, msg='')
+    threading.Thread(target=_upd_worker, args=(apk,), daemon=True).start()
+    return dict(_upd)
+
+
+def update_status(q=None):
+    with _UPDLOCK: return dict(_upd)
 
 
 PAGE = """<!doctype html><html lang=ar dir=rtl><meta charset=utf-8>
@@ -433,7 +640,9 @@ PAGE = """<!doctype html><html lang=ar dir=rtl><meta charset=utf-8>
 .hd{display:flex;align-items:center;gap:12px;margin:6px 0 14px}.hd svg{flex:none;filter:drop-shadow(0 4px 10px rgba(34,224,92,.35))}
 .hd h1{margin:0;font-size:27px;letter-spacing:3px;background:linear-gradient(90deg,var(--ac),var(--ac2));-webkit-background-clip:text;background-clip:text;color:transparent}
 .hd small{display:block;color:var(--mu);letter-spacing:2px;font-size:10px}.sp{flex:1}
-#tg{width:44px;height:44px;font-size:20px;border-radius:14px;background:var(--card);color:var(--tx);border:1px solid var(--ln)}
+#tg,#up{width:44px;height:44px;font-size:20px;border-radius:14px;background:var(--card);color:var(--tx);border:1px solid var(--ln)}#up{margin-inline-end:8px}
+.pbar{height:14px;border-radius:9px;background:var(--ln);overflow:hidden;margin:10px 0}.pbar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--ac2),var(--ac));transition:width .3s}
+.lcid{font-size:30px;font-weight:800;letter-spacing:6px;text-align:center;color:var(--ac);margin:8px 0}.lk{border-color:var(--wn)!important}
 input{width:100%;padding:13px;margin:5px 0;font-size:16px;border-radius:14px;border:1px solid var(--ln);background:var(--bg);color:var(--tx)}
 .pw{position:relative}.pw input{padding-left:50px}.eye{position:absolute;left:6px;top:9px;width:38px;height:38px;border:0;background:none;font-size:18px;color:var(--mu)}
 .main{width:100%;padding:14px;margin-top:6px;border:0;border-radius:14px;background:var(--ac);color:var(--onac);font-size:17px;font-weight:700;box-shadow:0 6px 16px rgba(7,163,104,.35)}.main:disabled{opacity:.6}
@@ -462,10 +671,13 @@ input{width:100%;padding:13px;margin:5px 0;font-size:16px;border-radius:14px;bor
 </style>
 <div class=hd>
 <svg viewBox="0 0 512 512" width=58 height=58 aria-label="Z-Wifi"><defs><linearGradient id=zbg x1=0 y1=0 x2=0 y2=1><stop offset=0 stop-color="#0c3a1e"/><stop offset=1 stop-color="#030604"/></linearGradient><linearGradient id=zfg x1=0 y1=0 x2=0 y2=1><stop offset=0 stop-color="#ffffff"/><stop offset=1 stop-color="#aabeb2"/></linearGradient></defs><rect width=512 height=512 rx=112 fill="url(#zbg)"/><rect x=3 y=3 width=506 height=506 rx=110 fill=none stroke="#22e05c" stroke-opacity=".45" stroke-width=6 /><polygon points="65,212 305,212 305,256 161,378 305,378 305,422 65,422 65,378 209,256 65,256" fill="url(#zfg)"/><g fill=none stroke="#22e05c" stroke-width=18 stroke-linecap=round><path d="M315.4 148.2A50 50 0 0 1 360.8 193.6"/><path d="M318.7 110.3A88 88 0 0 1 398.7 190.3"/><path d="M322.0 72.5A126 126 0 0 1 436.5 187.0"/></g><circle cx=311 cy=198 r=14 fill="#22e05c"/></svg>
-<div><h1>Z-WIFI</h1><small>SCAN • ANALYZE • OPTIMIZE</small></div><span class=sp></span><button id=tg type=button aria-label=theme></button></div>
+<div><h1>Z-WIFI</h1><small>SCAN • ANALYZE • OPTIMIZE</small></div><span class=sp></span><button id=up type=button aria-label=update>⬆</button><button id=tg type=button aria-label=theme></button></div>
+<div id=upd></div>
 <div class=card id=fm>
+<div id=lic></div>
 <div id=sv></div>
 <input id=ip placeholder="IP الأكسس" inputmode=decimal><input id=us placeholder="اسم المستخدم" value=root autocapitalize=none>
+<input id=lc placeholder="📍 مكان الجهاز (ملاحظة تُحفظ معه)" maxlength=60>
 <div class=pw><input id=pw type=password placeholder="كلمة السر"><button type=button class=eye id=eye>👁</button></div>
 <button class=main id=btn>بدء الفحص</button><button class="main alt" id=sv2 type=button>💾 حفظ هذا الجهاز</button><button class="main alt" id=nw type=button>➕ جهاز جديد</button></div>
 <div id=out></div>
@@ -479,8 +691,8 @@ setTheme(st0||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'
 $('tg').onclick=()=>setTheme(document.documentElement.dataset.theme=='dark'?'light':'dark');
 $('eye').onclick=()=>{$('pw').type=$('pw').type=='password'?'text':'password'};
 $('btn').onclick=go;
-$('nw').onclick=()=>{$('ip').value='';$('us').value='root';$('pw').value='';$('pw').type='password';const bx=$('dvb');if(bx)bx.open=false;$('ip').focus()};
-$('sv2').onclick=async()=>{const ip=$('ip').value.trim();if(!ip)return;try{DV=await(await fetch('/devices',{method:'POST',body:JSON.stringify({op:'save',ip:ip,user:$('us').value,name:''})})).json()}catch(e){}showDv()};
+$('nw').onclick=()=>{$('ip').value='';$('us').value='root';$('lc').value='';$('pw').value='';$('pw').type='password';const bx=$('dvb');if(bx)bx.open=false;$('ip').focus()};
+$('sv2').onclick=async()=>{const ip=$('ip').value.trim();if(!ip)return;try{DV=await(await fetch('/devices',{method:'POST',body:JSON.stringify({op:'save',ip:ip,user:$('us').value,name:'',loc:$('lc').value})})).json()}catch(e){}showDv()};
 if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js').catch(()=>{});
 let R=null,TAB='near',LAST='',DV=[];
 const ql=s=>s>=-55?'ممتازة':s>=-65?'جيدة جدًا':s>=-75?'جيدة':s>=-85?'ضعيفة':'ضعيفة جدًا';
@@ -520,7 +732,7 @@ async function applyCh(){
   bx.innerHTML=(j.error?'⚠ '+esc(j.error):'✔ '+esc(j.message))+lg(j.log);
   b.closest('.card').after(bx);if(!j.error)R.channel=ch;
  }catch(e){alert(e)}
- finally{b.disabled=false;b.textContent='تطبيق'}
+ finally{b.disabled=false;b.textContent='تطبيق';loadLic()}
 }
 function endScan(){
  R=null;out.innerHTML='';$('fm').style.display='';window.scrollTo(0,0);($('pw').value?$('btn'):$('pw')).focus();
@@ -528,21 +740,67 @@ function endScan(){
 async function loadDv(){try{DV=await(await fetch('/devices')).json()}catch(e){DV=[]}showDv()}
 function showDv(){
  const op=$('dvb')&&$('dvb').open;
- $('sv').innerHTML=DV.length?'<details id=dvb class=dvb'+(op?' open':'')+'><summary><span>الأجهزة المحفوظة <span class=cnt>'+DV.length+'</span></span></summary><div class=dvl>'+DV.map((d,i)=>'<div class=dvr><button class=cm data-i="'+i+'"><bdi dir=ltr>'+esc(d.ip)+'</bdi>'+(d.name?' • '+esc(d.name):'')+'</button><button class=cx data-i="'+i+'">✕</button></div>').join('')+'</div></details>':'';
- document.querySelectorAll('.cm').forEach(b=>b.onclick=()=>{const d=DV[b.dataset.i];$('ip').value=d.ip;$('us').value=d.user||'root';const bx=$('dvb');if(bx)bx.open=false;$('pw').focus()});
+ $('sv').innerHTML=DV.length?'<details id=dvb class=dvb'+(op?' open':'')+'><summary><span>الأجهزة المحفوظة <span class=cnt>'+DV.length+'</span></span></summary><div class=dvl>'+DV.map((d,i)=>'<div class=dvr><button class=cm data-i="'+i+'"><bdi dir=ltr>'+esc(d.ip)+'</bdi>'+(d.name?' • '+esc(d.name):'')+(d.loc?'<br><span class=mu>📍 '+esc(d.loc)+'</span>':'')+'</button><button class=cx data-i="'+i+'">✕</button></div>').join('')+'</div></details>':'';
+ document.querySelectorAll('.cm').forEach(b=>b.onclick=()=>{const d=DV[b.dataset.i];$('ip').value=d.ip;$('us').value=d.user||'root';$('lc').value=d.loc||'';const bx=$('dvb');if(bx)bx.open=false;$('pw').focus()});
  document.querySelectorAll('.cx').forEach(b=>b.onclick=async()=>{const d=DV[b.dataset.i];if(!confirm('حذف '+d.ip+' من المحفوظات؟'))return;try{DV=await(await fetch('/devices',{method:'POST',body:JSON.stringify({op:'del',ip:d.ip})})).json()}catch(e){}showDv()});
 }
 async function go(){
  if(!confirm('سيُفصل مشتركو هذا الأكسس لثوانٍ أثناء الفحص. متابعة؟'))return;
  out.innerHTML='<div class="card ctr mu">جارٍ الفحص... قد يستغرق دقيقة</div>';$('btn').disabled=true;LAST=$('ip').value.trim();
- try{const r=await fetch('/scan',{method:'POST',body:JSON.stringify({ip:$('ip').value,user:$('us').value,pw:$('pw').value})});
+ try{const r=await fetch('/scan',{method:'POST',body:JSON.stringify({ip:$('ip').value,user:$('us').value,pw:$('pw').value,loc:$('lc').value})});
   const j=await r.json();
   if(j.error){R=null;out.innerHTML='<div class="card err">⚠ '+esc(j.error)+'</div>'+lg(j.log);return}
   R=j;TAB='near';$('fm').style.display='none';view();loadDv();window.scrollTo(0,0);
  }catch(e){out.innerHTML='<div class="card err">⚠ '+esc(e)+'</div>'}
- finally{$('btn').disabled=false}
+ finally{$('btn').disabled=false;loadLic()}
 }
-loadDv();
+/* ===== الترخيص ===== */
+let LIC=null;
+async function loadLic(){try{LIC=await(await fetch('/license')).json();if(LIC.error)LIC=null}catch(e){LIC=null}showLic()}
+async function cp(t){try{await navigator.clipboard.writeText(t);return 1}catch(e){const a=document.createElement('textarea');a.value=t;document.body.appendChild(a);a.select();let ok=0;try{ok=document.execCommand('copy')}catch(x){}a.remove();return ok}}
+function showLic(){
+ const b=$('lic');if(!LIC){b.innerHTML='';return}
+ const lock=!LIC.licensed&&LIC.left<=0;$('btn').disabled=lock;
+ if(LIC.licensed){b.innerHTML='<div class=mu style="margin-bottom:8px">✔ التطبيق مرخّص</div>';return}
+ if(!lock){b.innerHTML='<div class=mu style="margin-bottom:8px">نسخة تجريبية: المتبقي <b>'+LIC.left+'</b> من '+LIC.limit+' عملية</div>';return}
+ b.innerHTML='<div class="card lk" style="margin:0 0 10px"><b>🔒 انتهت التجربة المجانية</b><div class=mu style="margin-top:6px">أنجزت '+LIC.limit+' عملية. للاستمرار أرسل طلب التفعيل، وسيصلك كود من 6 أرقام.</div><div class=mu style="margin-top:10px">معرّف الجهاز</div><div class=lcid dir=ltr>'+esc(LIC.id)+'</div><button class="main alt" id=lcs type=button>📤 إرسال طلب التفعيل</button><input id=lck placeholder="كود التفعيل (6 أرقام)" inputmode=numeric maxlength=6 autocomplete=off><button class=main id=lca type=button>تفعيل</button><div id=lcm class=mu style="margin-top:8px"></div></div>';
+ const m=$('lcm');
+ $('lcs').onclick=async()=>{const t='طلب تفعيل Z-Wifi'+String.fromCharCode(10)+'معرّف الجهاز: '+LIC.id;
+  try{if(navigator.share){await navigator.share({text:t});return}}catch(e){if(e&&e.name=='AbortError')return}
+  m.style.color='';m.textContent=(await cp(t))?'✔ نُسخ الطلب، الصقه وأرسله لي (واتساب أو أي برنامج)':'⚠ تعذر النسخ، أرسل لي: Z-Wifi '+LIC.id};
+ $('lca').onclick=async()=>{try{const j=await(await fetch('/license',{method:'POST',body:JSON.stringify({code:$('lck').value})})).json();
+  if(j.error){m.textContent='⚠ '+j.error;m.style.color='var(--bd)';return}
+  LIC=j;showLic()}catch(e){m.textContent='⚠ '+e;m.style.color='var(--bd)'}};
+}
+/* ===== التحديث ===== */
+let UT=null;
+function upBox(h,close){const b=$('upd');b.innerHTML=h?'<div class=card>'+h+(close?'<button class="main alt" id=upx type=button>إغلاق</button>':'')+'</div>':'';if($('upx'))$('upx').onclick=()=>{clearTimeout(UT);upBox('')}}
+function upProg(s){
+ const p=Math.max(1,Math.min(100,s.pct||1));
+ upBox('<div class=row><b>'+(s.state=='installing'?'تم التنزيل':'جارٍ تنزيل التحديث')+'</b><b dir=ltr>'+p+'%</b></div><div class=pbar><i style="width:'+p+'%"></i></div>'+(s.msg?'<div class=mu>'+esc(s.msg)+'</div>':''),s.state=='installing');
+}
+async function pollUp(){
+ clearTimeout(UT);
+ try{const s=await(await fetch('/update/status')).json();
+  if(s.state=='downloading'||s.state=='installing')upProg(s);
+  else if(s.state=='error'||s.state=='needperm'){upBox('<div style="color:var(--'+(s.state=='error'?'bd':'wn')+')">'+(s.state=='error'?'⚠ ':'ℹ ')+esc(s.msg)+'</div>',1);return}
+  if(s.state=='downloading')UT=setTimeout(pollUp,500)}
+ catch(e){UT=setTimeout(pollUp,1000)}
+}
+async function checkUp(){
+ upBox('<div class="ctr mu">جارٍ البحث عن تحديث...</div>');
+ try{const j=await(await fetch('/update/check')).json();
+  if(j.error){upBox('<div style="color:var(--bd)">⚠ '+esc(j.error)+'</div>',1);return}
+  if(!j.newer){upBox('<div class=ctr>✔ أنت على آخر إصدار ('+esc(j.current)+')</div>',1);return}
+  upBox('<b>يتوفر إصدار جديد '+esc(j.latest)+'</b><div class=mu>الإصدار الحالي: '+esc(j.current)+'</div>'+(j.notes?'<div class=mu style="margin-top:6px">'+esc(j.notes)+'</div>':'')+'<button class=main id=ups type=button>تحديث الآن</button>',1);
+  $('ups').onclick=async()=>{try{const s=await(await fetch('/update/start',{method:'POST',body:'{}'})).json();
+    if(s.error){upBox('<div style="color:var(--bd)">⚠ '+esc(s.error)+'</div>',1);return}
+    if(s.state=='needperm'){upBox('<div style="color:var(--wn)">ℹ '+esc(s.msg)+'</div>',1);return}
+    upProg(s);pollUp()}catch(e){upBox('<div style="color:var(--bd)">⚠ '+esc(e)+'</div>',1)}};
+ }catch(e){upBox('<div style="color:var(--bd)">⚠ '+esc(e)+'</div>',1)}
+}
+$('up').onclick=checkUp;
+loadDv();loadLic();
 </script></html>
 """
 
@@ -558,7 +816,15 @@ class H(BaseHTTPRequestHandler):
         s.end_headers()
         s.wfile.write(b)
 
+    def js(s, fn):
+        try: r = fn()
+        except Exception as e: r = {'error': str(e), 'log': getattr(e, 'log', [])}
+        s.out(200, json.dumps(r), 'application/json')
+
     def do_GET(s):
+        if s.path == '/license': return s.js(lic_state)
+        if s.path == '/update/check': return s.js(update_check)
+        if s.path == '/update/status': return s.js(update_status)
         if s.path == '/manifest.json': return s.out(200, MANIFEST, 'application/json')
         if s.path == '/devices': return s.out(200, json.dumps(devs_load()), 'application/json')
         if s.path == '/sw.js': return s.out(200, SW, 'application/javascript')
@@ -585,13 +851,22 @@ class H(BaseHTTPRequestHandler):
         try:
             q = json.loads(s.rfile.read(int(s.headers.get('Content-Length', 0))))
             if s.path == '/devices': return s.out(200, json.dumps(devs_op(q)), 'application/json')
-            if s.path == '/setchan': return s.out(200, json.dumps(set_channel(q)), 'application/json')
-            devs_op({'op': 'save', 'ip': q.get('ip', ''), 'user': q.get('user', '')})
+            if s.path == '/license': return s.out(200, json.dumps(lic_activate(q)), 'application/json')
+            if s.path == '/update/start': return s.out(200, json.dumps(update_start(q)), 'application/json')
+            if s.path == '/setchan':
+                lic_gate()
+                r = set_channel(q)
+                lic_count()
+                return s.out(200, json.dumps(r), 'application/json')
+            lic_gate()
+            lc = {'loc': q['loc']} if 'loc' in q else {}
+            devs_op({'op': 'save', 'ip': q.get('ip', ''), 'user': q.get('user', ''), **lc})
             r = run(q)
-            devs_op({'op': 'save', 'ip': q.get('ip', ''), 'user': q.get('user', ''), 'name': r.get('model', '')})
+            lic_count()
+            devs_op({'op': 'save', 'ip': q.get('ip', ''), 'user': q.get('user', ''), 'name': r.get('model', ''), **lc})
             s.out(200, json.dumps(r), 'application/json')
         except Exception as e:
-            s.out(200, json.dumps({'error': str(e), 'log': getattr(e, 'log', [])}), 'application/json')
+            s.out(200, json.dumps({'error': str(e), 'log': getattr(e, 'log', []), 'license': isinstance(e, LicFail)}), 'application/json')
 
 
 def serve(port=PORT):

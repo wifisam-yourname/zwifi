@@ -15,6 +15,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Inject license secret
+        env:
+          LIC: ${{ secrets.LIC_SECRET }}
+        run: |
+          test -n "$LIC"
+          sed -i "s/__LIC_SECRET__/$LIC/" app/src/main/python/zwifi.py
+          ! grep -q __LIC_SECRET__ app/src/main/python/zwifi.py
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
