@@ -762,8 +762,9 @@ function showLic(){
  const b=$('lic');if(!LIC){b.innerHTML='';return}
  const lock=!LIC.licensed&&LIC.left<=0;$('btn').disabled=lock;
  if(LIC.licensed){b.innerHTML='<div class=mu style="margin-bottom:8px">✔ التطبيق مرخّص</div>';return}
- if(!lock){b.innerHTML='<div class=mu style="margin-bottom:8px">نسخة تجريبية: المتبقي <b>'+LIC.left+'</b> من '+LIC.limit+' عملية</div>';return}
- b.innerHTML='<div class="card lk" style="margin:0 0 10px"><b>🔒 انتهت التجربة المجانية</b><div class=mu style="margin-top:6px">أنجزت '+LIC.limit+' عملية. للاستمرار أرسل طلب التفعيل، وسيصلك كود من 6 أرقام.</div><div class=mu style="margin-top:10px">معرّف الجهاز</div><div class=lcid dir=ltr>'+esc(LIC.id)+'</div><button class="main alt" id=lcs type=button>📤 إرسال طلب التفعيل</button><input id=lck placeholder="كود التفعيل (6 أرقام)" inputmode=numeric maxlength=6 autocomplete=off><button class=main id=lca type=button>تفعيل</button><div id=lcm class=mu style="margin-top:8px"></div></div>';
+ const inner='<div class=mu style="margin-top:10px">معرّف الجهاز</div><div class="lcid" dir=ltr>'+esc(LIC.id)+'</div><button class="main alt" id=lcs type=button>📤 إرسال طلب التفعيل</button><input id=lck placeholder="كود التفعيل (6 أرقام)" inputmode=numeric maxlength=6 autocomplete=off><button class=main id=lca type=button>تفعيل</button><div id=lcm class=mu style="margin-top:8px"></div>';
+ if(!lock)b.innerHTML='<div class=mu style="margin-bottom:8px">نسخة تجريبية: المتبقي <b>'+LIC.left+'</b> من '+LIC.limit+' عملية</div><details style="margin:0 0 10px"><summary class=mu>معرّف الجهاز والتفعيل</summary>'+inner+'</details>';
+ else b.innerHTML='<div class="card lk" style="margin:0 0 10px"><b>🔒 انتهت التجربة المجانية</b><div class=mu style="margin-top:6px">أنجزت '+LIC.limit+' عملية. للاستمرار أرسل طلب التفعيل، وسيصلك كود من 6 أرقام.</div>'+inner+'</div>';
  const m=$('lcm');
  $('lcs').onclick=async()=>{const t='طلب تفعيل Z-Wifi'+String.fromCharCode(10)+'معرّف الجهاز: '+LIC.id;
   try{if(navigator.share){await navigator.share({text:t});return}}catch(e){if(e&&e.name=='AbortError')return}
@@ -800,7 +801,8 @@ async function checkUp(silent){
  }catch(e){if(!silent)upBox('<div style="color:var(--bd)">⚠ '+esc(e)+'</div>',1)}
 }
 $('up').onclick=()=>checkUp(false);
-loadDv();loadLic();setTimeout(()=>checkUp(true),1500);
+loadDv();loadLic();let LCK=0;function autoUp(){const n=Date.now();if(n-LCK<300000||($('upd').innerHTML||'').includes('pbar'))return;LCK=n;checkUp(true)}
+setTimeout(autoUp,1500);document.addEventListener('visibilitychange',()=>{if(!document.hidden)autoUp()});
 </script></html>
 """
 
