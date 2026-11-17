@@ -1,6 +1,1 @@
-{
-  "versionCode": 3,
-  "versionName": "2.1",
-  "apk": "https://github.com/wifisam-yourname/zwifi/releases/latest/download/Z-Wifi.apk",
-  "notes": "ملاحظة مكان الجهاز، الترخيص، التحديث من داخل التطبيق"
-}
+{"versionCode": 5, "versionName": "2.3", "apk": "https://github.com/wifisam-yourname/zwifi/releases/download/v2.3/Z-Wifi.apk", "notes": "عرض معرّف الجهاز في النسخة التجريبية، وفحص التحديث عند الرجوع للتطبيق"}
