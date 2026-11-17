@@ -787,20 +787,20 @@ async function pollUp(){
   if(s.state=='downloading')UT=setTimeout(pollUp,500)}
  catch(e){UT=setTimeout(pollUp,1000)}
 }
-async function checkUp(){
- upBox('<div class="ctr mu">جارٍ البحث عن تحديث...</div>');
+async function checkUp(silent){
+ if(!silent)upBox('<div class="ctr mu">جارٍ البحث عن تحديث...</div>');
  try{const j=await(await fetch('/update/check')).json();
-  if(j.error){upBox('<div style="color:var(--bd)">⚠ '+esc(j.error)+'</div>',1);return}
-  if(!j.newer){upBox('<div class=ctr>✔ أنت على آخر إصدار ('+esc(j.current)+')</div>',1);return}
+  if(j.error){if(!silent)upBox('<div style="color:var(--bd)">⚠ '+esc(j.error)+'</div>',1);return}
+  if(!j.newer){if(!silent)upBox('<div class=ctr>✔ أنت على آخر إصدار ('+esc(j.current)+')</div>',1);return}
   upBox('<b>يتوفر إصدار جديد '+esc(j.latest)+'</b><div class=mu>الإصدار الحالي: '+esc(j.current)+'</div>'+(j.notes?'<div class=mu style="margin-top:6px">'+esc(j.notes)+'</div>':'')+'<button class=main id=ups type=button>تحديث الآن</button>',1);
   $('ups').onclick=async()=>{try{const s=await(await fetch('/update/start',{method:'POST',body:'{}'})).json();
     if(s.error){upBox('<div style="color:var(--bd)">⚠ '+esc(s.error)+'</div>',1);return}
     if(s.state=='needperm'){upBox('<div style="color:var(--wn)">ℹ '+esc(s.msg)+'</div>',1);return}
     upProg(s);pollUp()}catch(e){upBox('<div style="color:var(--bd)">⚠ '+esc(e)+'</div>',1)}};
- }catch(e){upBox('<div style="color:var(--bd)">⚠ '+esc(e)+'</div>',1)}
+ }catch(e){if(!silent)upBox('<div style="color:var(--bd)">⚠ '+esc(e)+'</div>',1)}
 }
-$('up').onclick=checkUp;
-loadDv();loadLic();
+$('up').onclick=()=>checkUp(false);
+loadDv();loadLic();setTimeout(()=>checkUp(true),1500);
 </script></html>
 """
 
