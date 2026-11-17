@@ -522,6 +522,26 @@ def lic_activate(q):
     return lic_state()
 
 
+# رقم واتساب المالك بالصيغة الدولية (967 = اليمن) لاستقبال طلبات التفعيل
+OWNER_WA = '967779639412'
+
+
+def lic_send(q=None):
+    st = lic_state()
+    txt = 'طلب تفعيل Z-Wifi' + chr(10) + 'معرّف الجهاز: ' + st['id']
+    url = 'https://wa.me/' + OWNER_WA + '?text=' + urllib.parse.quote(txt)
+    try:
+        from java import jclass
+        c = _app_ctx()
+        I = jclass('android.content.Intent')
+        it = I(I.ACTION_VIEW, jclass('android.net.Uri').parse(url))
+        it.addFlags(I.FLAG_ACTIVITY_NEW_TASK)
+        c.startActivity(it)
+    except Exception as e:
+        raise Fail('تعذر فتح واتساب: ' + str(e)[:60])
+    return {'ok': 1}
+
+
 # ───────────────────────── التحديث من داخل التطبيق ─────────────────────────
 # UPDATE_URL: رابط https لملف JSON يحدد آخر إصدار (انظر update.json). فارغ = التحديث معطّل.
 UPDATE_URL = 'https://raw.githubusercontent.com/wifisam-yourname/zwifi/main/update.json'
@@ -767,6 +787,7 @@ function showLic(){
  else b.innerHTML='<div class="card lk" style="margin:0 0 10px"><b>🔒 انتهت التجربة المجانية</b><div class=mu style="margin-top:6px">أنجزت '+LIC.limit+' عملية. للاستمرار أرسل طلب التفعيل، وسيصلك كود من 6 أرقام.</div>'+inner+'</div>';
  const m=$('lcm');
  $('lcs').onclick=async()=>{const t='طلب تفعيل Z-Wifi'+String.fromCharCode(10)+'معرّف الجهاز: '+LIC.id;
+  try{const r=await(await fetch('/license/send',{method:'POST',body:'{}'})).json();if(!r.error){m.style.color='';m.textContent='فُتح واتساب، اضغط إرسال';return}}catch(e){}
   try{if(navigator.share){await navigator.share({text:t});return}}catch(e){if(e&&e.name=='AbortError')return}
   m.style.color='';m.textContent=(await cp(t))?'✔ نُسخ الطلب، الصقه وأرسله لي (واتساب أو أي برنامج)':'⚠ تعذر النسخ، أرسل لي: Z-Wifi '+LIC.id};
  $('lca').onclick=async()=>{try{const j=await(await fetch('/license',{method:'POST',body:JSON.stringify({code:$('lck').value})})).json();
@@ -853,6 +874,7 @@ class H(BaseHTTPRequestHandler):
         try:
             q = json.loads(s.rfile.read(int(s.headers.get('Content-Length', 0))))
             if s.path == '/devices': return s.out(200, json.dumps(devs_op(q)), 'application/json')
+            if s.path == '/license/send': return s.out(200, json.dumps(lic_send(q)), 'application/json')
             if s.path == '/license': return s.out(200, json.dumps(lic_activate(q)), 'application/json')
             if s.path == '/update/start': return s.out(200, json.dumps(update_start(q)), 'application/json')
             if s.path == '/setchan':
